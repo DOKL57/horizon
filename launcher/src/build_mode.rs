@@ -6,11 +6,13 @@ use super::*;
 use crate::glass_ui as ui;
 use native_mods::{Profile, Route, Stage};
 use native_status::State;
+use std::rc::Rc;
 
 /// Build status for one fingerprint. The status and unbuilt ids arrive together.
 #[derive(Default)]
 pub(super) struct NativeStateMemo {
-    key: String,
+    // Each cache miss allocates its own key, even when revisiting a fingerprint.
+    key: Rc<str>,
     pub(super) state: Option<State>,
     pub(super) unbuilt: Vec<String>,
 }
@@ -24,8 +26,12 @@ impl NativeStateMemo {
         }
     }
 
-    fn finish(&mut self, key: &str, state: State, unbuilt: Vec<String>) -> bool {
-        if self.key != key {
+    fn mod_unbuilt(&self, id: &str) -> Option<bool> {
+        self.state.map(|_| self.unbuilt.iter().any(|u| u == id))
+    }
+
+    fn finish(&mut self, key: &Rc<str>, state: State, unbuilt: Vec<String>) -> bool {
+        if !Rc::ptr_eq(&self.key, key) {
             return false;
         }
         self.state = Some(state);
@@ -363,9 +369,10 @@ impl Launcher {
             native_status::fingerprint(&home, version.as_deref())
         );
         let mut memo = self.mods.native_state.borrow_mut();
-        if let Some(previous) = memo.as_ref().filter(|m| m.key == key) {
+        if let Some(previous) = memo.as_ref().filter(|m| m.key.as_ref() == key) {
             return previous.state;
         }
+        let key = Rc::<str>::from(key);
         *memo = Some(NativeStateMemo {
             key: key.clone(),
             ..NativeStateMemo::default()
@@ -402,15 +409,9 @@ impl Launcher {
     }
 
     /// Whether native mod `id` of the selected instance waits for a build.
-    pub(super) fn native_mod_unbuilt(&self, id: &str, cx: &mut Context<Self>) -> bool {
-        if let Some(instance) = self.selected_instance() {
-            self.native_state_of(instance, cx);
-        }
-        self.mods
-            .native_state
-            .borrow()
-            .as_ref()
-            .is_some_and(|m| m.unbuilt.iter().any(|u| u == id))
+    pub(super) fn native_mod_unbuilt(&self, id: &str, cx: &mut Context<Self>) -> Option<bool> {
+        self.native_state_of(self.selected_instance()?, cx)?;
+        self.mods.native_state.borrow().as_ref()?.mod_unbuilt(id)
     }
 
     /// A bordered panel, as the build card and its warning sit on the page.
@@ -1226,14 +1227,39 @@ mod native_state_tests {
 
     #[test]
     fn a_late_build_status_cannot_replace_the_selected_instances_status() {
+        let current = Rc::<str>::from("second");
         let mut memo = NativeStateMemo {
-            key: "second".into(),
+            key: current.clone(),
             ..Default::default()
         };
-        assert!(!memo.finish("first", State::NotBuilt, vec!["old-mod".into()]));
+        assert!(!memo.finish(&"first".into(), State::NotBuilt, vec!["old-mod".into()]));
         assert_eq!(memo.state, None);
         assert!(memo.unbuilt.is_empty());
-        assert!(memo.finish("second", State::UpToDate, vec![]));
+        assert!(memo.finish(&current, State::UpToDate, vec![]));
         assert_eq!(memo.state, Some(State::UpToDate));
+    }
+
+    #[test]
+    fn a_late_scan_cannot_replace_a_new_scan_of_the_same_fingerprint() {
+        let old = Rc::<str>::from("same");
+        let current = Rc::<str>::from("same");
+        let mut memo = NativeStateMemo {
+            key: current.clone(),
+            ..Default::default()
+        };
+        assert!(memo.finish(&current, State::NotBuilt, vec!["mod".into()]));
+        assert!(!memo.finish(&old, State::UpToDate, vec![]));
+        assert_eq!(memo.state, Some(State::NotBuilt));
+        assert_eq!(memo.mod_unbuilt("mod"), Some(true));
+    }
+
+    #[test]
+    fn a_mod_status_is_pending_until_the_scan_finishes() {
+        let mut memo = NativeStateMemo::default();
+        let key = memo.key.clone();
+        assert_eq!(memo.mod_unbuilt("ready"), None);
+        assert!(memo.finish(&key, State::NotBuilt, vec!["unbuilt".into()]));
+        assert_eq!(memo.mod_unbuilt("ready"), Some(false));
+        assert_eq!(memo.mod_unbuilt("unbuilt"), Some(true));
     }
 }

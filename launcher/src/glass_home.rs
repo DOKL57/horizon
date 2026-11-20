@@ -456,7 +456,10 @@ impl Launcher {
                     self.native_progress
                         .map(|p| build_mode::percent(Some(p)) as f32 / 100.),
                 )),
-                _ if mods.is_some() && mod_state.is_none() && ready && update.is_none() => {
+                _ if wait_for_mod_scan(running, mods.is_some() && mod_state.is_none())
+                    && ready
+                    && update.is_none() =>
+                {
                     Some((tr("Reading the mods…").into(), None))
                 }
                 // One build at a time: another instance's build first, and this one says whose.
@@ -1272,9 +1275,20 @@ fn launch_command(id: &str) -> String {
     format!("horizon-launcher play --instance {id}")
 }
 
+fn wait_for_mod_scan(running: bool, pending: bool) -> bool {
+    !running && pending
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pending_scan_delays_play_but_keeps_stop_available() {
+        assert!(wait_for_mod_scan(false, true));
+        assert!(!wait_for_mod_scan(true, true));
+        assert!(!wait_for_mod_scan(false, false));
+    }
 
     #[test]
     fn an_edition_tab_goes_to_that_editions_instance_played_last() {
