@@ -7,6 +7,33 @@ use crate::glass_ui as ui;
 use native_mods::{Profile, Route, Stage};
 use native_status::State;
 
+/// Build status for one fingerprint. The status and unbuilt ids arrive together.
+#[derive(Default)]
+pub(super) struct NativeStateMemo {
+    key: String,
+    pub(super) state: Option<State>,
+    pub(super) unbuilt: Vec<String>,
+}
+
+impl NativeStateMemo {
+    pub(super) fn preview(state: State, unbuilt: Vec<String>) -> Self {
+        Self {
+            state: Some(state),
+            unbuilt,
+            ..Self::default()
+        }
+    }
+
+    fn finish(&mut self, key: &str, state: State, unbuilt: Vec<String>) -> bool {
+        if self.key != key {
+            return false;
+        }
+        self.state = Some(state);
+        self.unbuilt = unbuilt;
+        true
+    }
+}
+
 /// The running or finished native snapshot; serialize readers to avoid racing cache leases.
 pub(super) struct RouteMemo {
     key: String,
@@ -169,7 +196,7 @@ impl Launcher {
         let t = self.theme;
         let pal = Pal::of(&t);
         let instance = self.selected_instance()?;
-        let state = self.native_state_of(instance);
+        let state = self.native_state_of(instance, cx)?;
         let mine = self.native_for.as_deref() == Some(instance.id.as_str());
         let building = self.native_step.as_ref().filter(|_| mine);
         let error = self.native_error.as_ref().filter(|_| mine);
@@ -320,9 +347,13 @@ impl Launcher {
     }
 
     /// Where the instance's native mods stand, read again only when what it depends on changes.
-    pub(super) fn native_state_of(&self, instance: &instances::Instance) -> State {
+    pub(super) fn native_state_of(
+        &self,
+        instance: &instances::Instance,
+        cx: &mut Context<Self>,
+    ) -> Option<State> {
         if let Some(state) = self.mod_preview.state.filter(|_| self.mod_preview.active) {
-            return state;
+            return Some(state);
         }
         let version = self.version_of(instance).cloned();
         let home = self.mods.home();
@@ -332,37 +363,54 @@ impl Launcher {
             native_status::fingerprint(&home, version.as_deref())
         );
         let mut memo = self.mods.native_state.borrow_mut();
-        match memo.as_ref() {
-            Some((k, state, _)) if *k == key => *state,
-            _ => {
-                let built = version.as_deref().and_then(native_status::built);
-                let enabled = native_status::enabled(&home);
-                let state = native_status::in_mode(
-                    native_status::state(&enabled, built.as_deref()),
-                    version.as_deref().and_then(native_status::built_profile),
-                    profile,
-                );
-                // A build in another mode rebuilds every mod; otherwise only the changed ones.
-                let unbuilt = match state {
-                    native_status::State::NotBuilt => enabled.into_iter().map(|m| m.0).collect(),
-                    _ => native_status::unbuilt(&enabled, built.as_deref()),
-                };
-                *memo = Some((key, state, unbuilt));
-                state
-            }
+        if let Some(previous) = memo.as_ref().filter(|m| m.key == key) {
+            return previous.state;
         }
+        *memo = Some(NativeStateMemo {
+            key: key.clone(),
+            ..NativeStateMemo::default()
+        });
+        let work = cx.background_executor().spawn(async move {
+            let built = version.as_deref().and_then(native_status::built);
+            let enabled = native_status::enabled(&home);
+            let state = native_status::in_mode(
+                native_status::state(&enabled, built.as_deref()),
+                version.as_deref().and_then(native_status::built_profile),
+                profile,
+            );
+            // A build in another mode rebuilds every mod; otherwise only the changed ones.
+            let unbuilt = match state {
+                State::NotBuilt => enabled.into_iter().map(|m| m.0).collect(),
+                _ => native_status::unbuilt(&enabled, built.as_deref()),
+            };
+            (state, unbuilt)
+        });
+        cx.spawn(async move |this, cx| {
+            let (state, unbuilt) = work.await;
+            let _ = this.update(cx, |this, cx| {
+                let mut memo = this.mods.native_state.borrow_mut();
+                if memo
+                    .as_mut()
+                    .is_some_and(|m| m.finish(&key, state, unbuilt))
+                {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        None
     }
 
-    /// Whether native mod `id` of the selected instance waits for a build ([`Self::native_state_of`]).
-    pub(super) fn native_mod_unbuilt(&self, id: &str) -> bool {
+    /// Whether native mod `id` of the selected instance waits for a build.
+    pub(super) fn native_mod_unbuilt(&self, id: &str, cx: &mut Context<Self>) -> bool {
         if let Some(instance) = self.selected_instance() {
-            self.native_state_of(instance);
+            self.native_state_of(instance, cx);
         }
         self.mods
             .native_state
             .borrow()
             .as_ref()
-            .is_some_and(|(_, _, unbuilt)| unbuilt.iter().any(|u| u == id))
+            .is_some_and(|m| m.unbuilt.iter().any(|u| u == id))
     }
 
     /// A bordered panel, as the build card and its warning sit on the page.
@@ -803,7 +851,7 @@ impl Launcher {
     pub(super) fn route_facts(&self, mod_id: &str, cx: &mut Context<Self>) -> Option<RouteFacts> {
         let pal = Pal::of(&self.theme);
         let instance = self.selected_instance()?;
-        let state = self.native_state_of(instance);
+        let state = self.native_state_of(instance, cx)?;
         let busy = self.native_step.is_some();
         let building = busy && self.native_for.as_deref() == Some(instance.id.as_str());
         let routes = self.native_routes(cx);
@@ -948,7 +996,8 @@ impl Launcher {
         let instance = self.selected_instance().map(|i| i.id.clone());
         let state = self
             .selected_instance()
-            .map_or(State::NoMods, |i| self.native_state_of(i));
+            .and_then(|i| self.native_state_of(i, cx))
+            .unwrap_or(State::NoMods);
         let busy = self.native_step.is_some();
         let mine = self.native_for.is_some() && self.native_for == instance;
         let stop = self.worlds_stop(mine);
@@ -1169,4 +1218,22 @@ fn text_in(size: f32, color: Hsla) -> Div {
         .text_size(px(size))
         .line_height(px((size * 1.4).round()))
         .text_color(color)
+}
+
+#[cfg(test)]
+mod native_state_tests {
+    use super::*;
+
+    #[test]
+    fn a_late_build_status_cannot_replace_the_selected_instances_status() {
+        let mut memo = NativeStateMemo {
+            key: "second".into(),
+            ..Default::default()
+        };
+        assert!(!memo.finish("first", State::NotBuilt, vec!["old-mod".into()]));
+        assert_eq!(memo.state, None);
+        assert!(memo.unbuilt.is_empty());
+        assert!(memo.finish("second", State::UpToDate, vec![]));
+        assert_eq!(memo.state, Some(State::UpToDate));
+    }
 }

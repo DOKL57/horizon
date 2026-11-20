@@ -26,7 +26,9 @@ impl Launcher {
         let mut body = div().flex().flex_col();
         body = body.children(self.mods_busy_plate());
         if !fresh {
-            return body.child(ui::empty().child(tr("Reading the mods…")));
+            return body
+                .child(ui::empty().child(tr("Reading the mods…")))
+                .child(m.pending_list(&self.content_scroll.handle));
         }
         if count == 0 {
             return body.child(
@@ -333,7 +335,9 @@ impl Launcher {
         let mine = self
             .selected_instance()
             .is_some_and(|i| self.native_for.as_deref() == Some(i.id.as_str()));
-        let unbuilt = id.as_deref().is_some_and(|id| self.native_mod_unbuilt(id));
+        let unbuilt = id
+            .as_deref()
+            .is_some_and(|id| self.native_mod_unbuilt(id, cx));
         let left = id
             .as_deref()
             .and_then(|id| left_out.iter().find(|l| l.id == id));
