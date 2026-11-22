@@ -9,6 +9,8 @@ use std::time::Instant;
 
 /// Play, the version and the big icons are this tall (`h-14`).
 const TALL: f32 = 56.;
+
+const MOD_SCAN_BUSY_LABEL: &str = "Reading the mods";
 /// The window width from which Home's head is laid out as the mockup's `xl` (1280 px); under it
 /// Play and the version are narrower and the invite code takes what is left of their row. The
 /// account page and the theme editor also put their two columns side by side from it.
@@ -460,7 +462,7 @@ impl Launcher {
                     && ready
                     && update.is_none() =>
                 {
-                    Some((tr("Reading the mods…").into(), None))
+                    Some((tr(MOD_SCAN_BUSY_LABEL).into(), None))
                 }
                 // One build at a time: another instance's build first, and this one says whose.
                 _ if needs_build && self.native_step.is_some() => Some((
@@ -611,10 +613,7 @@ impl Launcher {
                         .font_family(horizon_theme::glass::FONT)
                         .text_size(px(16.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(match progress {
-                            Some(p) => format!("{label} {:.0}%", p * 100.),
-                            None => format!("{label}…"),
-                        }),
+                        .child(play_busy_caption(&label, progress)),
                 ),
             None if running => base
                 .bg(white(0.14))
@@ -1275,6 +1274,13 @@ fn launch_command(id: &str) -> String {
     format!("horizon-launcher play --instance {id}")
 }
 
+fn play_busy_caption(label: &str, progress: Option<f32>) -> String {
+    match progress {
+        Some(p) => format!("{label} {:.0}%", p * 100.),
+        None => format!("{label}…"),
+    }
+}
+
 fn wait_for_mod_scan(running: bool, pending: bool) -> bool {
     !running && pending
 }
@@ -1288,6 +1294,19 @@ mod tests {
         assert!(wait_for_mod_scan(false, true));
         assert!(!wait_for_mod_scan(true, true));
         assert!(!wait_for_mod_scan(false, false));
+    }
+
+    #[test]
+    fn play_shows_one_ellipsis_while_reading_mods() {
+        use crate::i18n::{tr_in, Language};
+
+        for (language, expected) in [
+            (Language::English, "Reading the mods…"),
+            (Language::Russian, "Чтение модов…"),
+        ] {
+            let label = tr_in(language, MOD_SCAN_BUSY_LABEL);
+            assert_eq!(play_busy_caption(label, None), expected);
+        }
     }
 
     #[test]
